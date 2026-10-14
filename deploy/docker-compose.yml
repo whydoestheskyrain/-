@@ -1,0 +1,123 @@
+# =====================================================================
+# 虚拟数字资产交易平台 —— Docker Compose 一键编排
+# 包含：MySQL 8.0 / Redis 7 / Spring Boot 后端 / Nginx(前端+反代)
+# 常用命令：
+#   首次启动：  docker compose up -d
+#   查看日志：  docker compose logs -f backend
+#   重启后端：  docker compose restart backend
+#   停止全部：  docker compose down
+#   清空数据重来：docker compose down && rm -rf data/mysql/* && docker compose up -d
+# =====================================================================
+
+services:
+
+  mysql:
+    image: mysql:8.0
+    container_name: trade-mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-123456}
+      MYSQL_DATABASE: trade_db
+      TZ: Asia/Shanghai
+    command:
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --default-authentication-plugin=caching_sha2_password
+    volumes:
+      # 数据持久化到宿主机
+      - ./data/mysql:/var/lib/mysql
+      # 首次启动（data/mysql 为空）自动执行建表脚本
+      - ./mysql/init:/docker-entrypoint-initdb.d:ro
+      # 字符集强制配置：禁用客户端 latin1 协商，所有连接统一 utf8mb4
+      - ./mysql/conf/my.cnf:/etc/mysql/conf.d/my.cnf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks:
+      - trade-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: trade-redis
+    restart: always
+    command: redis-server --appendonly yes
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    networks:
+      - trade-net
+
+  backend:
+    image: eclipse-temurin:8-jre
+    container_name: trade-backend
+    restart: always
+    working_dir: /app
+    volumes:
+      # jar 只读挂载，升级时替换文件后 restart backend 即可
+      - ./backend/virtual-trade.jar:/app/app.jar:ro
+      # 上传的图片持久化，容器重建不丢失
+      - ./data/uploads:/app/uploads
+      - /etc/localtime:/etc/localtime:ro
+    command: java -Xms256m -Xmx512m -jar /app/app.jar --spring.profiles.active=prod
+    environment:
+      # ===== 数据库（容器服务名 mysql） =====
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: trade_db
+      DB_USERNAME: root
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:-123456}
+      # ===== Redis（容器服务名 redis） =====
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      # ===== 站点与跨域（注意：用 8080 端口访问时要带端口，见 .env） =====
+      APP_SERVER_HOST: ${APP_SERVER_HOST:-127.0.0.1}
+      APP_CORS_ORIGINS: ${APP_CORS_ORIGINS:-http://127.0.0.1}
+      # ===== 安全密钥（务必在 .env 中填写真实值） =====
+      JWT_SECRET: ${JWT_SECRET:-dev-only-secret-please-change-in-production-0123456789}
+      # ===== 支付宝沙箱 =====
+      ALIPAY_APP_ID: ${ALIPAY_APP_ID:-}
+      ALIPAY_APP_PRIVATE_KEY: ${ALIPAY_APP_PRIVATE_KEY:-}
+      ALIPAY_PUBLIC_KEY: ${ALIPAY_PUBLIC_KEY:-}
+      ALIPAY_RETURN_URL: http://${APP_SERVER_HOST:-127.0.0.1}/#/user/center
+      ALIPAY_NOTIFY_URL: http://${APP_SERVER_HOST:-127.0.0.1}/alipay/notify
+      ALIPAY_RECHARGE_NOTIFY_URL: http://${APP_SERVER_HOST:-127.0.0.1}/recharge/notify
+      # ===== 阿里云百炼 DashScope（AI 桌宠） =====
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      DASHSCOPE_APP_ID: ${DASHSCOPE_APP_ID:-}
+      TZ: Asia/Shanghai
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - trade-net
+
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: trade-nginx
+    restart: always
+    ports:
+      # 唯一对宿主机暴露的端口；云安全组放行 8080
+      - "8080:80"
+    volumes:
+      # 前端 dist 内容
+      - ./nginx/html:/usr/share/nginx/html:ro
+      # 站点配置
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - /etc/localtime:/etc/localtime:ro
+    depends_on:
+      - backend
+    networks:
+      - trade-net
+
+networks:
+  trade-net:
+    driver: bridge
